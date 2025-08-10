@@ -1,18 +1,17 @@
-# app.py — PI Finder (v2 list + classic v1 details, with on-page diagnostics)
+# app.py — PI Finder using ClinicalTrials.gov API v2 only
+# Pulls PIs from contactsLocationsModule.overallOfficials (no classic API)
 
 import io, csv, re, time
 import requests
 from flask import Flask, request, render_template_string, Response
 
-# Endpoints
 API_V2_STUDIES = "https://clinicaltrials.gov/api/v2/studies"
-API_V1_FULL = "https://classic.clinicaltrials.gov/api/query/full_studies"
-
 HEADERS = {
-    "User-Agent": "PI-Finder/1.0 (+contact: research use; email: you@example.com)",
+    "User-Agent": "PI-Finder/1.0 (+research contact: you@example.com)",
     "Accept": "application/json",
 }
 
+# Treat these as investigator roles (adjust if you want fewer/more)
 ROLE_RX = re.compile(
     r"(principal\s*investigator|site\s*principal\s*investigator|study\s*chair|study\s*director|sub-?investigator)",
     re.I,
@@ -42,14 +41,12 @@ PAGE = """
   .muted{color:var(--muted)} .pill{display:inline-block;padding:2px 8px;border-radius:9999px;border:1px solid var(--border);font-size:12px;background:#fafbff}
   .mt8{margin-top:8px}.mt12{margin-top:12px}
   .small{font-size:12px}
-  .err{color:#b91c1c}
-  .ok{color:#065f46}
 </style>
 </head>
 <body>
   <header>
     <h1>PI Finder · ClinicalTrials.gov</h1>
-    <div class="sub">Find PIs by city/state. Lists trials via API v2, then pulls PI names via classic API v1 per NCT ID.</div>
+    <div class="sub">Uses the modern API v2 only — pulls Overall Officials (PIs) directly.</div>
   </header>
 
   <div class="wrap">
@@ -78,7 +75,7 @@ PAGE = """
         </div>
         <div>
           <label>Max trials to scan</label>
-          <input class="input" type="number" name="max" value="{{max or 60}}">
+          <input class="input" type="number" name="max" value="{{max or 100}}">
         </div>
         <div class="row" style="align-self:end">
           <button class="btn" type="submit">Search</button>
@@ -93,33 +90,16 @@ PAGE = """
       <div class="row" style="gap:12px;">
         <strong>Results</strong>
         <span class="pill">{{rows|length}}</span>
-        <span class="muted">Fetched (list via v2): {{fetched}} · City-matched: {{matched}} · With PI names: {{rows|length}}</span>
+        <span class="muted">Fetched: {{fetched}} · City-matched: {{matched}} · With PI names: {{rows|length}}</span>
       </div>
 
       {% if error %}
-        <div class="mt8 err">Error: {{error}}</div>
+        <div class="mt8" style="color:#b91c1c">Error: {{error}}</div>
       {% elif not tried %}
         <div class="muted mt8">Enter a city and click Search.</div>
       {% elif rows|length == 0 %}
         <div class="muted mt8">No PI names were returned for matched trials. Try removing Condition/Phase or increasing Max.</div>
-      {% endif %}
-
-      <div class="mt8 small">
-        <div><strong>Diagnostics</strong> — v2 list endpoint: <code>{{v2_url}}</code></div>
-        <div>classic v1 detail endpoint used per trial: <code>https://classic.clinicaltrials.gov/api/query/full_studies?expr=NCTXXXXX&min_rnk=1&max_rnk=1&fmt=json</code></div>
-        {% if v1_errors %}
-          <div class="err">Sample v1 errors (first 2):</div>
-          <ul>
-            {% for e in v1_errors[:2] %}
-              <li class="err">{{e}}</li>
-            {% endfor %}
-          </ul>
-        {% elif tried %}
-          <div class="ok">v1 detail calls: {{v1_calls}} ok</div>
-        {% endif %}
-      </div>
-
-      {% if rows %}
+      {% else %}
         <div class="mt8" style="max-height:60vh;overflow:auto;border:1px solid var(--border);border-radius:12px;">
           <table>
             <thead><tr>
@@ -142,16 +122,17 @@ PAGE = """
           </table>
         </div>
       {% endif %}
+      <div class="mt8 small muted">
+        Endpoint used: <code>{{v2_url}}</code>
+      </div>
     </div>
   </div>
 </body>
 </html>
 """
 
-# ---------- Helpers ----------
-
 def v2_list(expr: str, page_size: int = 200):
-    """Get a broad list of studies using the modern v2 API."""
+    """Get a list of studies using API v2 (single page)."""
     params = {
         "query.term": expr,
         "pageSize": str(page_size),
@@ -166,7 +147,6 @@ def v2_list(expr: str, page_size: int = 200):
     return studies, url
 
 def match_city_state(study: dict, city: str, state: str):
-    """Check locations for a city/state hit."""
     proto = study.get("protocolSection", {}) or {}
     mod = proto.get("contactsLocationsModule", {}) or {}
     locs = mod.get("locations", []) or []
@@ -182,69 +162,73 @@ def match_city_state(study: dict, city: str, state: str):
             return c, s
     return None, None
 
-def v1_officials_by_nct(nct_id: str):
-    """
-    For a single trial, call classic v1 to get Overall Officials (incl PI).
-    """
-    # Use single-study fetch via NCT id
-    params = {"expr": nct_id, "min_rnk": 1, "max_rnk": 1, "fmt": "json"}
-    r = requests.get(API_V1_FULL, params=params, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    try:
-        proto = data["FullStudiesResponse"]["FullStudies"][0]["Study"]["ProtocolSection"]
-        mod = proto.get("ContactsLocationsModule", {}) or {}
-        # Standard location list
-        # Officials list variants
-        offs = (mod.get("OverallOfficialList", {}) or {}).get("OverallOfficial", []) or []
-        if not offs:
-            offs = mod.get("OverallOfficials", []) or []
-    except Exception:
-        return []
+def extract_officials_v2(study: dict):
+    """Pull overallOfficials from v2 contactsLocationsModule."""
+    proto = study.get("protocolSection", {}) or {}
+    mod = proto.get("contactsLocationsModule", {}) or {}
+    offs = mod.get("overallOfficials", []) or []
 
     out = []
-    for off in offs or []:
-        name = off.get("OverallOfficialName") or off.get("OfficialName") or ""
-        role = off.get("OverallOfficialRole") or off.get("OfficialRole") or ""
-        aff  = off.get("OverallOfficialAffiliation") or off.get("OfficialAffiliation") or ""
+    for off in offs:
+        # v2 typically uses these keys:
+        name = off.get("name") or ""
+        role = off.get("role") or ""
+        aff  = off.get("affiliation") or ""
         if name and role and ROLE_RX.search(role):
             out.append({"name": name, "role": role, "affiliation": aff})
     return out
 
-def get_text(proto, path: list, default=""):
-    m = proto
-    try:
-        for k in path:
-            m = m.get(k, {})
-    except Exception:
-        return default
-    return m or default
-
-def title_status_phase(study_v2: dict):
-    proto = study_v2.get("protocolSection", {}) or {}
+def title_status_phase_v2(study: dict):
+    proto = study.get("protocolSection", {}) or {}
     idm = proto.get("identificationModule", {}) or {}
     title = idm.get("officialTitle") or idm.get("briefTitle") or ""
     status = (proto.get("statusModule", {}) or {}).get("overallStatus") or ""
     phases = proto.get("designModule", {}).get("phases") or []
     phases_text = ";".join(phases) if isinstance(phases, list) else (phases or "")
-    return title, status, phases_text
+    nct = idm.get("nctId") or study.get("nctId") or ""
+    return title, status, phases_text, nct
 
-# ---------- Routes ----------
+def build_rows_v2(studies, user_city, user_state, max_rows):
+    rows = []
+    matched = 0
+    for s in studies:
+        c, s_state = match_city_state(s, user_city, user_state)
+        if c is None:
+            continue
+        matched += 1
+        officials = extract_officials_v2(s)
+        if not officials:
+            continue
+        title, status, phases, nct = title_status_phase_v2(s)
+        for off in officials:
+            rows.append({
+                "pi_name": off["name"], "role": off["role"], "affiliation": off.get("affiliation",""),
+                "city": c, "state": s_state, "nct_id": nct, "status": status, "phases": phases,
+                "study_title": title, "source": "v2.contactsLocationsModule.overallOfficials"
+            })
+        if len(rows) >= max_rows:
+            break
+
+    # Deduplicate by (name, city, state)
+    seen = set(); deduped = []
+    for r in rows:
+        key = (r["pi_name"].lower(), (r["city"] or "").lower(), (r["state"] or "").lower())
+        if key in seen: continue
+        seen.add(key); deduped.append(r)
+    return matched, deduped
 
 @app.route("/")
 def home():
-    city = request.args.get("city", "")
+    city = request.args.get("city","")
     tried = bool(city)
-    state = request.args.get("state", "")
-    condition = request.args.get("condition", "")
-    phase = request.args.get("phase", "any")
-    max_trials = int(request.args.get("max", "60") or "60")
+    state = request.args.get("state","")
+    condition = request.args.get("condition","")
+    phase = request.args.get("phase","any")
+    max_trials = int(request.args.get("max","100") or "100")
 
+    error = ""
     rows = []
     fetched = matched = 0
-    error = ""
-    v1_errors = []
-    v1_calls_ok = 0
     v2_url = ""
 
     if tried:
@@ -252,95 +236,26 @@ def home():
             terms = " ".join([t for t in [city, state, condition, (phase if phase and phase.lower() != "any" else "")] if t]).strip() or city
             studies_v2, v2_url = v2_list(terms, page_size=min(max_trials, 200))
             fetched = len(studies_v2)
-
-            # city/state filter
-            matched_pairs = []
-            for s in studies_v2:
-                loc = match_city_state(s, city, state)
-                if loc[0] is not None:
-                    matched_pairs.append((s, loc))
-            matched = len(matched_pairs)
-
-            # per-trial PI lookup via classic v1
-            for s, (c_city, c_state) in matched_pairs[:max_trials]:
-                nct = (s.get("protocolSection", {}).get("identificationModule", {}) or {}).get("nctId") or s.get("nctId") or ""
-                if not nct:
-                    continue
-                try:
-                    officials = v1_officials_by_nct(nct)
-                    if officials:
-                        title, status, phases = title_status_phase(s)
-                        for off in officials:
-                            rows.append({
-                                "pi_name": off["name"],
-                                "role": off["role"],
-                                "affiliation": off.get("affiliation",""),
-                                "city": c_city, "state": c_state,
-                                "nct_id": nct, "status": status, "phases": phases,
-                                "study_title": title, "source": "v1.overall_officials"
-                            })
-                        v1_calls_ok += 1
-                except Exception as e:
-                    v1_errors.append(f"{nct}: {type(e).__name__}: {e}")
-                time.sleep(0.05)  # gentle pacing
-            # dedupe by (name, city, state)
-            seen = set(); deduped = []
-            for r in rows:
-                key = (r["pi_name"].lower(), (r["city"] or "").lower(), (r["state"] or "").lower())
-                if key in seen: continue
-                seen.add(key); deduped.append(r)
-            rows = deduped
-
+            matched, rows = build_rows_v2(studies_v2, city, state, max_trials)
         except Exception as e:
             error = str(e)
 
     export_url = f"/export?city={city}&state={state}&condition={condition}&phase={phase}&max={max_trials}"
-    return render_template_string(PAGE,
-        city=city, state=state, condition=condition, phase=phase, max=max_trials,
-        rows=rows, fetched=fetched, matched=matched, tried=tried, error=error,
-        v1_errors=v1_errors, v1_calls=v1_calls_ok, v2_url=v2_url,
-        export_url=export_url
-    )
+    return render_template_string(PAGE, city=city, state=state, condition=condition, phase=phase, max=max_trials,
+                                  tried=tried, rows=rows, fetched=fetched, matched=matched, error=error, v2_url=v2_url)
 
 @app.route("/export")
 def export():
-    # re-run the same logic quickly to generate CSV
-    with app.test_request_context("/", query_string=request.query_string.decode()):
-        resp = home()
-        # render_template_string returns HTML; we need the data again.
-    # Easiest: redo minimal fetch for CSV
-    city = request.args.get("city", "")
-    state = request.args.get("state", "")
-    condition = request.args.get("condition", "")
-    phase = request.args.get("phase", "any")
-    max_trials = int(request.args.get("max", "60") or "60")
+    city = request.args.get("city","")
+    state = request.args.get("state","")
+    condition = request.args.get("condition","")
+    phase = request.args.get("phase","any")
+    max_trials = int(request.args.get("max","100") or "100")
 
     terms = " ".join([t for t in [city, state, condition, (phase if phase and phase.lower() != "any" else "")] if t]).strip() or city
     studies_v2, _ = v2_list(terms, page_size=min(max_trials, 200))
+    matched, rows = build_rows_v2(studies_v2, city, state, max_trials)
 
-    rows = []
-    for s in studies_v2:
-        loc = match_city_state(s, city, state)
-        if loc[0] is None:
-            continue
-        nct = (s.get("protocolSection", {}).get("identificationModule", {}) or {}).get("nctId") or s.get("nctId") or ""
-        if not nct:
-            continue
-        try:
-            officials = v1_officials_by_nct(nct)
-            if officials:
-                title, status, phases = title_status_phase(s)
-                for off in officials:
-                    rows.append({
-                        "pi_name": off["name"], "role": off["role"], "affiliation": off.get("affiliation",""),
-                        "city": loc[0], "state": loc[1], "nct_id": nct, "status": status, "phases": phases,
-                        "study_title": title, "source": "v1.overall_officials"
-                    })
-        except Exception:
-            pass
-        time.sleep(0.02)
-
-    # CSV stream
     def generate():
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=["pi_name","role","affiliation","city","state","nct_id","status","phases","study_title","source"])
@@ -352,9 +267,8 @@ def export():
 
     filename = f"pi_{city.replace(' ','_').lower()}_{(state or 'all').lower()}.csv"
     return Response(generate(), mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
 
-# Render start: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Local dev
+    app.run(host="0.0.0.0", port=5000, debug=True)
