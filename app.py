@@ -3,7 +3,7 @@ import io, csv, re, math
 import requests
 from flask import Flask, request, render_template_string, Response
 
-API_V1_FULL_STUDIES = "https://clinicaltrials.gov/api/query/full_studies"
+API_V1_FULL_STUDIES = "https://classic.clinicaltrials.gov/api/query/full_studies"
 HEADERS = {"User-Agent": "PI-Finder/1.0 (+contact: research use)"}
 ROLE_RX = re.compile(r"(principal\s*investigator|study\s*chair|study\s*director|sub-?investigator)", re.I)
 
