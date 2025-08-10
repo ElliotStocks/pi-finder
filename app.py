@@ -117,32 +117,36 @@ PAGE = """
 """
 
 def fetch_full_studies(expr, max_rnk):
-    """Pull Full Studies (v1) in pages. Returns list of Study dicts."""
-    page_size = 100  # v1 is happy with 100/page
-    studies = []
-    total = 0
-    for start in range(1, max_rnk + 1, page_size):
-        end = min(start + page_size - 1, max_rnk)
-        params = {
-            "expr": expr,
-            "min_rnk": start,
-            "max_rnk": end,
-            "fmt": "json"
-        }
-        r = requests.get(API_V1_FULL_STUDIES, params=params, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        resp = data.get("FullStudiesResponse", {})
-        total = max(total, resp.get("NStudiesFound", 0))
-        chunk = resp.get("FullStudies", []) or []
-        # Each item: {"Study": {...}}
-        for item in chunk:
-            if "Study" in item:
-                studies.append(item["Study"])
-        # Stop early if we’ve reached the end
-        if end >= total or not chunk:
-            break
-    return studies, total
+    """
+    Pull Full Studies (v1) from the classic domain. If anything goes wrong,
+    try the non-classic domain as a fallback.
+    """
+    def call(endpoint):
+        page_size = 100
+        studies = []
+        total = 0
+        for start in range(1, max_rnk + 1, page_size):
+            end = min(start + page_size - 1, max_rnk)
+            params = {"expr": expr, "min_rnk": start, "max_rnk": end, "fmt": "json"}
+            r = requests.get(endpoint, params=params, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            resp = data.get("FullStudiesResponse", {})
+            total = max(total, resp.get("NStudiesFound", 0))
+            chunk = resp.get("FullStudies", []) or []
+            for item in chunk:
+                if "Study" in item:
+                    studies.append(item["Study"])
+            if end >= total or not chunk:
+                break
+        return studies, total
+
+    # Try classic first
+    try:
+        return call("https://classic.clinicaltrials.gov/api/query/full_studies")
+    except Exception:
+        # Fallback (in case classic changes temporarily)
+        return call("https://clinicaltrials.gov/api/query/full_studies")
 
 def pick_text(v):
     if isinstance(v, list):
