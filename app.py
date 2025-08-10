@@ -1,14 +1,21 @@
-# app.py — PI Finder using ClinicalTrials.gov Full Studies v1 (single endpoint)
-import io, csv, re, math
+# app.py — PI Finder (ClinicalTrials.gov Full Studies v1 on classic domain)
+# One-file Flask app. No scraping. Pulls Overall Officials (incl. PIs) and filters by city/state.
+
+import io, csv, re
 import requests
 from flask import Flask, request, render_template_string, Response
 
+# --- Config ---
 API_V1_FULL_STUDIES = "https://classic.clinicaltrials.gov/api/query/full_studies"
-HEADERS = {"User-Agent": "PI-Finder/1.0 (+contact: research use)"}
+HEADERS = {
+    "User-Agent": "PI-Finder/1.0 (+contact: research use; email: you@example.com)",
+    "Accept": "application/json",
+}
 ROLE_RX = re.compile(r"(principal\s*investigator|study\s*chair|study\s*director|sub-?investigator)", re.I)
 
 app = Flask(__name__)
 
+# --- UI Template ---
 PAGE = """
 <!doctype html>
 <html lang="en">
@@ -35,7 +42,7 @@ PAGE = """
 <body>
   <header>
     <h1>PI Finder · ClinicalTrials.gov</h1>
-    <div class="sub">Search by city. Uses the Full Studies API (v1) which contains PI names.</div>
+    <div class="sub">Search by city. Uses the classic Full Studies API (v1) to get Overall Officials (PIs).</div>
   </header>
   <div class="wrap">
     <div class="card">
@@ -116,68 +123,55 @@ PAGE = """
 </html>
 """
 
-def fetch_full_studies(expr, max_rnk):
-    """
-    Pull Full Studies (v1) from the classic domain. If anything goes wrong,
-    try the non-classic domain as a fallback.
-    """
-    def call(endpoint):
-        page_size = 100
-        studies = []
-        total = 0
-        for start in range(1, max_rnk + 1, page_size):
-            end = min(start + page_size - 1, max_rnk)
-            params = {"expr": expr, "min_rnk": start, "max_rnk": end, "fmt": "json"}
-            r = requests.get(endpoint, params=params, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            resp = data.get("FullStudiesResponse", {})
-            total = max(total, resp.get("NStudiesFound", 0))
-            chunk = resp.get("FullStudies", []) or []
-            for item in chunk:
-                if "Study" in item:
-                    studies.append(item["Study"])
-            if end >= total or not chunk:
-                break
-        return studies, total
+# --- Helpers ---
 
-    # Try classic first
-    try:
-        return call("https://classic.clinicaltrials.gov/api/query/full_studies")
-    except Exception:
-        # Fallback (in case classic changes temporarily)
-        return call("https://clinicaltrials.gov/api/query/full_studies")
+def fetch_full_studies(expr: str, max_rnk: int):
+    page_size = 100
+    studies = []
+    total_found = 0
+    start = 1
+    while start <= max_rnk:
+        end = min(start + page_size - 1, max_rnk)
+        params = {"expr": expr, "min_rnk": start, "max_rnk": end, "fmt": "json"}
+        r = requests.get(API_V1_FULL_STUDIES, params=params, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        resp = data.get("FullStudiesResponse", {}) or {}
+        total_found = max(total_found, resp.get("NStudiesFound", 0))
+        chunk = resp.get("FullStudies", []) or []
+        for item in chunk:
+            s = item.get("Study")
+            if s:
+                studies.append(s)
+        if not chunk or end >= total_found:
+            break
+        start = end + 1
+    return studies, total_found
 
-def pick_text(v):
-    if isinstance(v, list):
-        return "; ".join([x for x in v if x])
-    return v or ""
-
-def city_state_match(proto, city, state):
-    """Return first (city,state) facility match in ContactsLocationsModule."""
-    mod = proto.get("ProtocolSection", {}).get("ContactsLocationsModule", {})
-    locs = mod.get("LocationList", {}).get("Location", []) or []
-    city_norm = (city or "").strip().lower()
-    state_norm = (state or "").strip().lower()
+def city_state_match(study: dict, city: str, state: str):
+    proto = study.get("ProtocolSection", {}) or {}
+    mod = proto.get("ContactsLocationsModule", {}) or {}
+    locs = (mod.get("LocationList", {}) or {}).get("Location", []) or []
+    want_city = (city or "").strip().lower()
+    want_state = (state or "").strip().lower()
     for loc in locs:
-        c = (loc.get("LocationCity") or "").lower()
-        s = (loc.get("LocationState") or "").lower()
-        fac = (loc.get("LocationFacility") or "").lower()
-        city_ok = (not city_norm) or (city_norm in c) or (city_norm in fac)
-        state_ok = (not state_norm) or (state_norm in s)
+        c = (loc.get("LocationCity") or "")
+        s = (loc.get("LocationState") or "")
+        fac = (loc.get("LocationFacility") or "")
+        city_ok = (not want_city) or (want_city in c.lower()) or (want_city in fac.lower())
+        state_ok = (not want_state) or (want_state in (s or "").lower())
         if city_ok and state_ok:
-            return (loc.get("LocationCity") or ""), (loc.get("LocationState") or "")
+            return c, s
     return None, None
 
-def extract_officials(proto):
-    """Return list of overall officials with roles."""
-    mod = proto.get("ProtocolSection", {}).get("ContactsLocationsModule", {})
-    offs = mod.get("OverallOfficialList", {}).get("OverallOfficial", [])  # primary structure
-    # Some records use a slightly different key:
+def extract_officials(study: dict):
+    proto = study.get("ProtocolSection", {}) or {}
+    mod = proto.get("ContactsLocationsModule", {}) or {}
+    offs = (mod.get("OverallOfficialList", {}) or {}).get("OverallOfficial", []) or []
     if not offs:
-        offs = mod.get("OverallOfficials", [])  # fallback if present
+        offs = mod.get("OverallOfficials", []) or []
     out = []
-    for off in offs or []:
+    for off in offs:
         name = off.get("OverallOfficialName") or off.get("OfficialName") or ""
         role = off.get("OverallOfficialRole") or off.get("OfficialRole") or ""
         aff  = off.get("OverallOfficialAffiliation") or off.get("OfficialAffiliation") or ""
@@ -185,39 +179,36 @@ def extract_officials(proto):
             out.append({"name": name, "role": role, "affiliation": aff})
     return out
 
-def build_rows(studies, city, state):
+def build_rows(studies, user_city, user_state):
     rows = []
     matched = 0
-    for s in studies:
-        proto = s.get("ProtocolSection", {}) or {}
+    for study in studies:
+        proto = study.get("ProtocolSection", {}) or {}
         idm = proto.get("IdentificationModule", {}) or {}
         nct = idm.get("NCTId") or ""
         title = idm.get("OfficialTitle") or idm.get("BriefTitle") or ""
         status = proto.get("StatusModule", {}).get("OverallStatus") or ""
-        phases_list = proto.get("DesignModule", {}).get("PhaseList", {}).get("Phase", [])
-        phases = ";".join(phases_list) if isinstance(phases_list, list) else (phases_list or "")
-
-        c, s_abbrev = city_state_match(s, city, state)
+        phases_list = (proto.get("DesignModule", {}) or {}).get("PhaseList", {}) or {}
+        phases = phases_list.get("Phase", [])
+        phases_text = ";".join(phases) if isinstance(phases, list) else (phases or "")
+        c, s = city_state_match(study, user_city, user_state)
         if c is None:
             continue
         matched += 1
-
-        officials = extract_officials(s)
+        officials = extract_officials(study)
         for off in officials:
             rows.append({
                 "pi_name": off["name"],
                 "role": off["role"],
                 "affiliation": off.get("affiliation",""),
                 "city": c,
-                "state": s_abbrev,
+                "state": s,
                 "nct_id": nct,
                 "status": status,
-                "phases": phases,
+                "phases": phases_text,
                 "study_title": title,
                 "source": "v1.full_studies.overall_officials"
             })
-
-    # Dedupe by (name, city, state)
     seen = set()
     deduped = []
     for r in rows:
@@ -228,6 +219,8 @@ def build_rows(studies, city, state):
         deduped.append(r)
     return matched, deduped
 
+# --- Routes ---
+
 @app.route("/")
 def home():
     city = request.args.get("city","")
@@ -236,26 +229,22 @@ def home():
     condition = request.args.get("condition","")
     phase = request.args.get("phase","any")
     max_trials = int(request.args.get("max","200") or "200")
-
     error = ""
     rows = []
     fetched = matched = 0
-
     if tried:
         try:
-            # Build expression for v1 search (city + state + optional condition/phase)
-            expr_parts = [city, state, condition, (phase if phase and phase.lower() != "any" else "")]
+            expr_parts = [city, state, condition, (phase if (phase and phase.lower() != "any") else "")]
             expr = " ".join([p for p in expr_parts if p]).strip() or city
             studies, total = fetch_full_studies(expr, max_trials)
             fetched = min(total, max_trials)
             matched, rows = build_rows(studies, city, state)
         except Exception as e:
             error = str(e)
-
     export_url = f"/export?city={city}&state={state}&condition={condition}&phase={phase}&max={max_trials}"
-    return render_template_string(PAGE, city=city, state=state, condition=condition, phase=phase, max=max_trials,
-                                  tried=tried, rows=rows, fetched=fetched, matched=matched, error=error,
-                                  export_url=export_url)
+    return render_template_string(PAGE, city=city, state=state, condition=condition, phase=phase,
+                                  max=max_trials, tried=tried, rows=rows, fetched=fetched,
+                                  matched=matched, error=error, export_url=export_url)
 
 @app.route("/export")
 def export():
@@ -264,21 +253,23 @@ def export():
     condition = request.args.get("condition","")
     phase = request.args.get("phase","any")
     max_trials = int(request.args.get("max","200") or "200")
-
-    expr_parts = [city, state, condition, (phase if phase and phase.lower() != "any" else "")]
+    expr_parts = [city, state, condition, (phase if (phase and phase.lower() != "any") else "")]
     expr = " ".join([p for p in expr_parts if p]).strip() or city
     studies, total = fetch_full_studies(expr, max_trials)
     matched, rows = build_rows(studies, city, state)
-
     def generate():
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=["pi_name","role","affiliation","city","state","nct_id","status","phases","study_title","source"])
         writer.writeheader()
-        yield output.getvalue(); output.seek(0); output.truncate(0)
+        yield output.getvalue()
+        output.seek(0); output.truncate(0)
         for r in rows:
             writer.writerow(r)
-            yield output.getvalue(); output.seek(0); output.truncate(0)
-
+            yield output.getvalue()
+            output.seek(0); output.truncate(0)
     filename = f"pi_{city.replace(' ','_').lower()}_{(state or 'all').lower()}.csv"
     return Response(generate(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
