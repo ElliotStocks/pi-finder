@@ -1,4 +1,4 @@
-# app.py — PI Finder (Render-ready)
+# app.py — PI Finder (Render-ready, full search)
 import re, time, io, csv
 import requests
 from bs4 import BeautifulSoup
@@ -20,7 +20,7 @@ PAGE = """
   header{max-width:1000px;margin:24px auto 0;padding:0 16px}
   h1{font-size:22px;margin:0 0 8px}.sub{color:var(--muted);font-size:13px}
   .wrap{max-width:1000px;margin:16px auto 32px;padding:0 16px}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,0.03)}
   label{display:block;font-size:13px;margin-bottom:6px} input,select,button{font:inherit}
   .input,.select{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#fff}
   .grid{display:grid;gap:12px} @media (min-width:900px){.grid-6{grid-template-columns:repeat(6,1fr)}}
@@ -123,7 +123,7 @@ def fetch_studies(term, page_size=800):
     return data.get("studies", []) if isinstance(data, dict) else []
 
 def city_state_match(study, city, state):
-    city_norm = (city or "").strip().toLowerCase() if hasattr(str, "toLowerCase") else (city or "").strip().lower()
+    city_norm = (city or "").strip().lower()
     state_norm = (state or "").strip().lower()
     locs = []
     locations = study.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", []) or study.get("locations", [])
@@ -161,7 +161,7 @@ def parse_pi_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
     out = []
 
-    # 1) Overall Official blocks
+    # 1) Overall Official blocks (various layouts)
     for hdr in soup.find_all(string=re.compile(r"Overall\s+Official", re.I)):
         container = hdr.find_parent()
         if not container:
@@ -209,7 +209,7 @@ def parse_pi_from_html(html):
         if mname:
             out.append({"name": mname.group(1).strip(), "role": role_hit.group(0), "affiliation": ""})
 
-    # Dedupe
+    # Dedupe by name+role
     seen, deduped = set(), []
     for r in out:
         key = (r["name"].lower(), r["role"].lower())
@@ -222,19 +222,7 @@ def search(city, state, condition="", phase="any", max_trials=400, delay=0.4):
     studies = fetch_studies(term, page_size=min(max_trials, 1000))
     matched = []
     for s in studies:
-        # lower() to compare
-        city_norm = (city or "").strip().lower()
-        state_norm = (state or "").strip().lower()
-        locs = []
-        locations = s.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", []) or s.get("locations", [])
-        for loc in locations or []:
-            c = (loc.get("city") or "").lower()
-            s2 = (loc.get("state") or "").lower()
-            fac = (loc.get("facility") or "").lower()
-            city_ok = (not city_norm) or (city_norm in c) or (city_norm in fac)
-            state_ok = (not state_norm) or (state_norm in s2)
-            if city_ok and state_ok:
-                locs.append(loc)
+        locs = city_state_match(s, city, state)
         if locs: matched.append((s, locs))
 
     rows = []
@@ -262,8 +250,6 @@ def search(city, state, condition="", phase="any", max_trials=400, delay=0.4):
         if key in seen: continue
         seen.add(key); deduped.append(r)
     return studies, matched, deduped
-
-app = Flask(__name__)
 
 @app.route("/")
 def home():
