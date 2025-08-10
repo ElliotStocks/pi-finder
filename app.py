@@ -1,7 +1,6 @@
-# app.py — PI Finder using ClinicalTrials.gov API v2 only
-# Pulls PIs from contactsLocationsModule.overallOfficials (no classic API)
+# app.py — PI Finder (API v2 only; pulls Overall Officials AND Site-level Investigators)
 
-import io, csv, re, time
+import io, csv, re
 import requests
 from flask import Flask, request, render_template_string, Response
 
@@ -11,7 +10,7 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Treat these as investigator roles (adjust if you want fewer/more)
+# Roles we consider as investigators (PI first, but include others as fallback)
 ROLE_RX = re.compile(
     r"(principal\s*investigator|site\s*principal\s*investigator|study\s*chair|study\s*director|sub-?investigator)",
     re.I,
@@ -46,7 +45,7 @@ PAGE = """
 <body>
   <header>
     <h1>PI Finder · ClinicalTrials.gov</h1>
-    <div class="sub">Uses the modern API v2 only — pulls Overall Officials (PIs) directly.</div>
+    <div class="sub">API v2 only — reads Overall Officials and site-level Investigators at matched locations.</div>
   </header>
 
   <div class="wrap">
@@ -75,7 +74,7 @@ PAGE = """
         </div>
         <div>
           <label>Max trials to scan</label>
-          <input class="input" type="number" name="max" value="{{max or 100}}">
+          <input class="input" type="number" name="max" value="{{max or 150}}">
         </div>
         <div class="row" style="align-self:end">
           <button class="btn" type="submit">Search</button>
@@ -122,6 +121,7 @@ PAGE = """
           </table>
         </div>
       {% endif %}
+
       <div class="mt8 small muted">
         Endpoint used: <code>{{v2_url}}</code>
       </div>
@@ -131,7 +131,9 @@ PAGE = """
 </html>
 """
 
-def v2_list(expr: str, page_size: int = 200):
+# -------------- API helpers --------------
+
+def v2_list(expr: str, page_size: int):
     """Get a list of studies using API v2 (single page)."""
     params = {
         "query.term": expr,
@@ -147,6 +149,7 @@ def v2_list(expr: str, page_size: int = 200):
     return studies, url
 
 def match_city_state(study: dict, city: str, state: str):
+    """Return first (city,state) match from locations[]."""
     proto = study.get("protocolSection", {}) or {}
     mod = proto.get("contactsLocationsModule", {}) or {}
     locs = mod.get("locations", []) or []
@@ -159,23 +162,50 @@ def match_city_state(study: dict, city: str, state: str):
         city_ok = (not want_city) or (want_city in c.lower()) or (want_city in (fac or "").lower())
         state_ok = (not want_state) or (want_state in (s or "").lower())
         if city_ok and state_ok:
-            return c, s
-    return None, None
+            return c, s, loc
+    return None, None, None
 
-def extract_officials_v2(study: dict):
-    """Pull overallOfficials from v2 contactsLocationsModule."""
+def extract_overall_officials_v2(study: dict):
+    """Overall officials at study level."""
     proto = study.get("protocolSection", {}) or {}
     mod = proto.get("contactsLocationsModule", {}) or {}
     offs = mod.get("overallOfficials", []) or []
-
     out = []
     for off in offs:
-        # v2 typically uses these keys:
         name = off.get("name") or ""
         role = off.get("role") or ""
         aff  = off.get("affiliation") or ""
         if name and role and ROLE_RX.search(role):
             out.append({"name": name, "role": role, "affiliation": aff})
+    return out
+
+def extract_site_investigators_v2(loc_obj: dict):
+    """
+    Site-level investigators/contacts.
+    Different records use different keys; handle common variants:
+      - loc['investigators'] : [{name, role, affiliation}]
+      - loc['contacts']      : [{name or (firstName/lastName), contactType}]
+    """
+    out = []
+
+    # 1) investigators array (preferred)
+    invs = loc_obj.get("investigators", []) or []
+    for inv in invs:
+        name = inv.get("name") or ""
+        role = inv.get("role") or ""
+        aff  = inv.get("affiliation") or ""
+        if name and (ROLE_RX.search(role or "") or "investigator" in (role or "").lower()):
+            out.append({"name": name, "role": role or "Investigator", "affiliation": aff})
+
+    # 2) contacts array as fallback
+    contacts = loc_obj.get("contacts", []) or []
+    for c in contacts:
+        # build a name if split fields exist
+        name = c.get("name") or " ".join([c.get("firstName") or "", c.get("middleName") or "", c.get("lastName") or ""]).strip()
+        role = c.get("contactType") or c.get("role") or ""
+        if name and (ROLE_RX.search(role or "") or "investigator" in (role or "").lower()):
+            out.append({"name": name, "role": role, "affiliation": ""})
+
     return out
 
 def title_status_phase_v2(study: dict):
@@ -192,20 +222,38 @@ def build_rows_v2(studies, user_city, user_state, max_rows):
     rows = []
     matched = 0
     for s in studies:
-        c, s_state = match_city_state(s, user_city, user_state)
-        if c is None:
+        c_city, c_state, loc_obj = match_city_state(s, user_city, user_state)
+        if c_city is None:
             continue
         matched += 1
-        officials = extract_officials_v2(s)
-        if not officials:
-            continue
+
         title, status, phases, nct = title_status_phase_v2(s)
-        for off in officials:
+
+        # 1) Overall officials (study-level)
+        offs = extract_overall_officials_v2(s)
+        for off in offs:
             rows.append({
-                "pi_name": off["name"], "role": off["role"], "affiliation": off.get("affiliation",""),
-                "city": c, "state": s_state, "nct_id": nct, "status": status, "phases": phases,
-                "study_title": title, "source": "v2.contactsLocationsModule.overallOfficials"
+                "pi_name": off["name"],
+                "role": off["role"],
+                "affiliation": off.get("affiliation",""),
+                "city": c_city, "state": c_state,
+                "nct_id": nct, "status": status, "phases": phases,
+                "study_title": title, "source": "v2.overallOfficials"
             })
+
+        # 2) Site-level investigators (location object)
+        if loc_obj:
+            site_invs = extract_site_investigators_v2(loc_obj)
+            for inv in site_invs:
+                rows.append({
+                    "pi_name": inv["name"],
+                    "role": inv.get("role","Investigator"),
+                    "affiliation": inv.get("affiliation",""),
+                    "city": c_city, "state": c_state,
+                    "nct_id": nct, "status": status, "phases": phases,
+                    "study_title": title, "source": "v2.location.investigators/contacts"
+                })
+
         if len(rows) >= max_rows:
             break
 
@@ -217,6 +265,8 @@ def build_rows_v2(studies, user_city, user_state, max_rows):
         seen.add(key); deduped.append(r)
     return matched, deduped
 
+# -------------- Routes --------------
+
 @app.route("/")
 def home():
     city = request.args.get("city","")
@@ -224,7 +274,7 @@ def home():
     state = request.args.get("state","")
     condition = request.args.get("condition","")
     phase = request.args.get("phase","any")
-    max_trials = int(request.args.get("max","100") or "100")
+    max_trials = int(request.args.get("max","150") or "150")
 
     error = ""
     rows = []
@@ -250,7 +300,7 @@ def export():
     state = request.args.get("state","")
     condition = request.args.get("condition","")
     phase = request.args.get("phase","any")
-    max_trials = int(request.args.get("max","100") or "100")
+    max_trials = int(request.args.get("max","150") or "150")
 
     terms = " ".join([t for t in [city, state, condition, (phase if phase and phase.lower() != "any" else "")] if t]).strip() or city
     studies_v2, _ = v2_list(terms, page_size=min(max_trials, 200))
